@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from time import time
 import numpy as np
+from torch_geometric.nn import PointConv, fps, radius, knn
 
 def timeit(tag, t):
     print("{}: {}s".format(tag, time() - t))
@@ -68,23 +69,35 @@ def farthest_point_sample(xyz, npoint):
     Return:
         centroids: sampled pointcloud index, [B, npoint]
     """
+    t = time()
     device = xyz.device
     B, N, C = xyz.shape
-    centroids = torch.zeros(B, npoint, dtype=torch.long).to(device)
-    distance = torch.ones(B, N).to(device) * 1e10
-    farthest = torch.randint(0, N, (B,), dtype=torch.long).to(device)
-    batch_indices = torch.arange(B, dtype=torch.long).to(device)
-    for i in range(npoint):
-        centroids[:, i] = farthest
-        centroid = xyz[batch_indices, farthest, :].view(B, 1, 3)
-        dist = torch.sum((xyz - centroid) ** 2, -1)
-        mask = dist < distance
-        distance[mask] = dist[mask]
-        farthest = torch.max(distance, -1)[1]
+    pos = xyz.contiguous().view(B*N, -1)
+    batch = torch.zeros((B, N), device=pos.device, dtype=torch.long)
+    for i in range(B): batch[i] = i
+    batch = batch.view(-1)
+    idx = fps(pos, batch, ratio=npoint/N)
+    centroids = idx.view(B, npoint)
+    # for i in range(B):
+    #     centroids[i] -= i*N
+    centroids %= N
+
+    # centroids = torch.zeros(B, npoint, dtype=torch.long).to(device)
+    # distance = torch.ones(B, N).to(device) * 1e10
+    # farthest = torch.randint(0, N, (B,), dtype=torch.long).to(device)
+    # batch_indices = torch.arange(B, dtype=torch.long).to(device)
+    # for i in range(npoint):
+    #     centroids[:, i] = farthest
+    #     centroid = xyz[batch_indices, farthest, :].view(B, 1, 3)
+    #     dist = torch.sum((xyz - centroid) ** 2, -1)
+    #     mask = dist < distance
+    #     distance[mask] = dist[mask]
+    #     farthest = torch.max(distance, -1)[1]
+    # timeit('farthest_point_sample', t)
     return centroids
 
 
-def query_ball_point(radius, nsample, xyz, new_xyz):
+def query_ball_point(r, nsample, xyz, new_xyz):
     """
     Input:
         radius: local region radius
@@ -94,16 +107,45 @@ def query_ball_point(radius, nsample, xyz, new_xyz):
     Return:
         group_idx: grouped points index, [B, S, nsample]
     """
+    t = time()
     device = xyz.device
     B, N, C = xyz.shape
     _, S, _ = new_xyz.shape
-    group_idx = torch.arange(N, dtype=torch.long).to(device).view(1, 1, N).repeat([B, S, 1])
-    sqrdists = square_distance(new_xyz, xyz)
-    group_idx[sqrdists > radius ** 2] = N
-    group_idx = group_idx.sort(dim=-1)[0][:, :, :nsample]
-    group_first = group_idx[:, :, 0].view(B, S, 1).repeat([1, 1, nsample])
-    mask = group_idx == N
-    group_idx[mask] = group_first[mask]
+    pos = xyz.contiguous().view(B * N, -1)
+    new_pos = new_xyz.contiguous().view(B * S, -1)
+    batch = torch.zeros((B, N), device=pos.device, dtype=torch.long)
+    new_batch = torch.zeros((B, S), device=pos.device, dtype=torch.long)
+    for i in range(B):
+        batch[i] = i
+        new_batch[i] = i
+    batch = batch.view(-1)
+    new_batch = new_batch.view(-1)
+
+    ###########################################################
+    row, col = radius(pos, new_pos, r, batch, new_batch, max_num_neighbors=nsample)
+    a = torch.zeros((B, S, nsample), device=pos.device, dtype=torch.long)
+    bc = row.bincount()
+    # b = torch.cat([torch.arange(i) for i in bc])
+    # b = b.to(pos.device)
+    b = torch.arange(row.shape[0]).to(pos.device)
+    # b -= bc[row] * row
+    b -= (bc.cumsum(0)[row])
+    a[new_batch[row], (row % S), b] = col
+    group_idx = a
+    ##########################################################
+    # row, col = knn(pos, new_pos, nsample, batch, new_batch)
+    # group_idx = col.view(B, S, nsample)
+    ###########################################################
+    group_idx %= N
+
+    # group_idx = torch.arange(N, dtype=torch.long).to(device).view(1, 1, N).repeat([B, S, 1])
+    # sqrdists = square_distance(new_xyz, xyz)
+    # group_idx[sqrdists > r ** 2] = N
+    # group_idx = group_idx.sort(dim=-1)[0][:, :, :nsample]
+    # group_first = group_idx[:, :, 0].view(B, S, 1).repeat([1, 1, nsample])
+    # mask = group_idx == N
+    # group_idx[mask] = group_first[mask]
+    # timeit('query_ball_point', t)
     return group_idx
 
 
